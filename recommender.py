@@ -1,49 +1,86 @@
-"""
-Модуль «Персональный подбор» – ChatGPT-рекомендации
-"""
-from typing import List, Dict
-from openai import OpenAI
-from sqlalchemy.orm import Session
-from models import User, Profile, SearchHistory, Feedback
-from config import (OPENAI_API_KEY, OPENAI_BASE_URL,
-                    RECOMMENDATION_LIMIT)
+"""recommender.py
 
-client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+Модуль «Персональный подбор» – интеллектуальные рекомендации.
+Использует OpenAI, если доступен; иначе возвращает пустые рекомендации.
+"""
+
+from typing import List, Dict
+from sqlalchemy.orm import Session
+
+from models import User, Profile, SearchHistory, Feedback
+from config import OPENAI_API_KEY, OPENAI_BASE_URL, RECOMMENDATION_LIMIT
+
+# Пытаемся импортировать OpenAI; если не получится, отключаем работу с ним
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+    # Простой stub-класс, чтобы код ниже не падал
+    class OpenAI:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat(self, *args, **kwargs):
+            raise RuntimeError("OpenAI не подключён")
+
+
+# Если OpenAI доступен, инициализируем клиент, иначе создаём stub
+client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL) if OPENAI_AVAILABLE else OpenAI()
 
 SYSTEM_PROMPT = (
-    "Ты — рекомендательный движок. "
-    f"Нужно выбрать до {RECOMMENDATION_LIMIT} id кандидатов, "
-    "наиболее подходящих текущему пользователю по стилю танца, уровню и городу. "
-    "Ответ — JSON-массив чисел."
+    "Ты — рекомендательный движок платформы поиска партнёров по танцам.\n"
+    "Вход: JSON c полем 'current_user' и списком 'candidates'.\n"
+    f"Выбери до {RECOMMENDATION_LIMIT} id кандидатов, наиболее подходящих "
+    "по стилю, уровню, городу, предпочтениям и предыдущей обратной связи.\n"
+    "Ответ строго JSON-массив чисел."
 )
 
-# helpers ------------------------------------------------------------------
+
+# ─────────────────────────────────────────────────────────── helpers
 def _user_json(u: User) -> Dict:
-    p = u.profile or Profile()
+    """Преобразовать пользователя в JSON для отправки в модель."""
+    prof = u.profile or Profile()
     return {
         "id": u.id,
         "city": u.city,
-        "style": p.main_style,
-        "level": p.level,
+        "profile": {
+            "main_style": prof.main_style,
+            "additional": prof.additional,
+            "level": prof.level,
+            "age": prof.age,
+            "gender": prof.gender,
+            "preferences": prof.preferences,
+        },
     }
 
+
 def _history_json(u: User) -> Dict:
+    """Преобразовать историю поиска и обратную связь пользователя в JSON."""
     return {
-        "history": [s.query for s in u.searches[-10:]],
+        "search_history": [s.query for s in u.searches[-10:]],
         "feedback": [
             {"partner_id": f.partner_id, "positive": f.positive}
             for f in u.feedback[-30:]
-        ],
+        ]
     }
 
-# core ---------------------------------------------------------------------
+
+# ─────────────────────────────────────────────────────────── main
 def get_recommendations(db: Session, user_id: int) -> List[int]:
+    """
+    Вернуть список ID рекомендованных партнёров (отсортировано).
+    Если OpenAI недоступен, возвращает пустой список.
+    """
     user = db.get(User, user_id)
-    if not user:
+    if not user or not user.profile:
         return []
 
+    # 1) Формируем пул кандидатов из того же города, кроме самого пользователя
     candidates = (
         db.query(User)
+          .join(Profile)
           .filter(User.id != user_id, User.city == user.city)
           .limit(300)
           .all()
@@ -51,22 +88,34 @@ def get_recommendations(db: Session, user_id: int) -> List[int]:
     if not candidates:
         return []
 
+    # Если OpenAI не установлен, сразу возвращаем пустое
+    if not OPENAI_AVAILABLE:
+        return []
+
+    # 2) Собираем полезную информацию для модели
     payload = {
         "current_user": _user_json(user) | _history_json(user),
         "candidates":  [_user_json(c) for c in candidates],
     }
 
+    # 3) Отправляем запрос в OpenAI
     try:
-        rsp = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role":"system","content":SYSTEM_PROMPT},
-                      {"role":"user","content":str(payload)}],
-            temperature=0.0, max_tokens=200
+            messages=[
+                {"role": "system",  "content": SYSTEM_PROMPT},
+                {"role": "user",    "content": str(payload)}
+            ],
+            temperature=0.2,
+            max_tokens=600
         )
-        ids = [int(x) for x in eval(rsp.choices[0].message.content)]
+        content = resp.choices[0].message.content
+        ids = [int(x) for x in eval(content, {}, {})]
     except Exception as e:
-        print("[Recommender] error:", e)
+        # Если OpenAI вернул ошибку или неверный формат, возвращаем пустой список
+        print("[Recommender] OpenAI error:", e)
         ids = []
 
-    valid_ids = {c.id for c in candidates}
-    return [i for i in ids if i in valid_ids][:RECOMMENDATION_LIMIT]
+    # 4) Фильтруем те ID, которых фактически нет в candidates
+    ids = [i for i in ids if any(c.id == i for c in candidates)]
+    return ids[:RECOMMENDATION_LIMIT]
