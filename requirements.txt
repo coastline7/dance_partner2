@@ -2,5 +2,5 @@ streamlit==1.29.0
 sqlalchemy==2.0.25
 pandas==2.0.3
 openai==0.27.8
-praw==7.10.0
+praw==7.8.0
 vk-api==11.9.3
