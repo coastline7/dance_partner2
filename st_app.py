@@ -163,26 +163,24 @@ def page_recommend():
     card_end()
 
 def page_social():
-    card_start()
-    st.markdown("### 📱 Посты из соцсетей (без авторизации)")
-    kw = st.text_input("Ключевые слова (через запятую)", "ищу партнёра")
-    if st.button("Обновить ленту"):
-        threading.Thread(
-            target=lambda: fetch_social(db_session(), kw.split(",")),
-            daemon=True
-        ).start()
-        st.success("Фоновая загрузка запущена. Обновите страницу через несколько секунд.")
+    from models import AggregatedItem
     with db_session() as s:
-        rows = s.execute(
-            "SELECT title,source,link FROM aggregated_items "
-            "WHERE module='social' ORDER BY published DESC LIMIT 20"
-        ).fetchall()
-    if not rows:
-        st.info("Постов пока нет. Нажмите «Обновить ленту», чтобы собрать.")
-    else:
-        for title, source, link in rows:
-            st.markdown(f"• **[{source}]** [{title}]({link})")
-    card_end()
+        # ORM-запрос: выбрать первые 20 записей с module='social', сортируя по published DESC
+        rows = (
+            s.query(AggregatedItem.title, AggregatedItem.source, AggregatedItem.link)
+            .filter(AggregatedItem.module == "social")
+            .order_by(AggregatedItem.published.desc())
+            .limit(20)
+            .all()
+        )
+
+     if not rows:
+         st.info("Постов пока нет. Нажмите «Обновить ленту», чтобы собрать.")
+     else:
+         for title, source, link in rows:
+             st.markdown(f"• **[{source}]** [{title}]({link})")
+     card_end()
+
 
 def page_analytics():
     card_start()
