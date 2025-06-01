@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit-прототип Dance Partner без авторизации, с правильной аналитикой:
+Streamlit-прототип Dance Partner без авторизации, с корректным ORM-запросом в page_social:
 • поиск сохраняет запросы в search_history через ORM
 • рекомендации показывают случайных пользователей
-• агрегация соцсетей
+• агрегация соцсетей (через Deferred Thread)
 • аналитика строит график по истории гостя
 • 7 вкладок (включая 404)
 • 2 темы (обычная и для слабовидящих)
@@ -21,12 +21,18 @@ from sqlalchemy.orm import Session
 
 from hashlib import sha256
 
-import pandas as pd  # для построения DataFrame
+import pandas as pd  # для построения DataFrame в аналитике
 
-from models           import SessionLocal, User, Profile, SearchHistory
-from recommender      import get_recommendations
-from social           import fetch_social
-from config           import RECOMMENDATION_LIMIT
+from models      import (
+    SessionLocal,
+    User,
+    Profile,
+    SearchHistory,
+    AggregatedItem
+)
+from recommender import get_recommendations
+from social      import fetch_social
+from config      import RECOMMENDATION_LIMIT
 
 # ──────────────────────────────────────────────
 #              1.  CSS-THEMES
@@ -60,10 +66,12 @@ body,div,input,select,textarea,label,h1,h2,h3,h4,h5{background:#000!important;co
 #       2.  DB & SESSION HELPERS
 # ──────────────────────────────────────────────
 def db_session() -> Session:
+    """Возвращает новый экземпляр сессии SQLAlchemy."""
     return SessionLocal()
 
 def current_user() -> Optional[User]:
-    return None  # авторизация отключена
+    """Авторизация отключена — всегда None."""
+    return None
 
 # ──────────────────────────────────────────────
 #                     3.  PAGES
@@ -82,7 +90,8 @@ def page_home():
 
 def page_search():
     """
-    «Поиск партнёров» сохраняет каждый запрос в таблицу search_history от имени 'guest'.
+    Страница «Поиск партнёров» теперь сохраняет каждый запрос
+    в таблицу search_history от имени пользователя 'guest'.
     """
     card_start()
     st.markdown("### 🔍 Поиск партнёров (запросы сохраняются за гостем)")
@@ -97,7 +106,7 @@ def page_search():
 
     if submitted:
         with db_session() as s:
-            # 1) Найти или создать гостя
+            # 1) Найти или создать гостевого пользователя
             guest = s.query(User).filter_by(username="guest").first()
             if not guest:
                 hashed = sha256("guest".encode()).hexdigest()
@@ -122,7 +131,7 @@ def page_search():
                 s.add(profile)
                 s.flush()
 
-            # 2) Сохранить через ORM
+            # 2) Сохраняем запрос в историю через ORM
             new_search = SearchHistory(
                 user_id=guest.id,
                 query=q,
@@ -144,13 +153,37 @@ def page_recommend():
     with db_session() as s:
         all_users = s.query(User).filter(User.username != "guest").all()
         if not all_users:
-            # создать демо-пользователей при пустой БД
-            demo1 = User(username="demo1", email="demo1@example.com", city="Москва",
-                         password=sha256("demo".encode()).hexdigest(), role="user")
-            demo1.profile = Profile(main_style="salsa", additional="", level="beginner", age=25, gender="male", preferences="")
-            demo2 = User(username="demo2", email="demo2@example.com", city="Санкт-Петербург",
-                         password=sha256("demo".encode()).hexdigest(), role="user")
-            demo2.profile = Profile(main_style="tango", additional="", level="intermediate", age=30, gender="female", preferences="")
+            # создаём демо-пользователей при пустой БД
+            demo1 = User(
+                username="demo1",
+                email="demo1@example.com",
+                city="Москва",
+                password=sha256("demo".encode()).hexdigest(),
+                role="user"
+            )
+            demo1.profile = Profile(
+                main_style="salsa",
+                additional="",
+                level="beginner",
+                age=25,
+                gender="male",
+                preferences=""
+            )
+            demo2 = User(
+                username="demo2",
+                email="demo2@example.com",
+                city="Санкт-Петербург",
+                password=sha256("demo".encode()).hexdigest(),
+                role="user"
+            )
+            demo2.profile = Profile(
+                main_style="tango",
+                additional="",
+                level="intermediate",
+                age=30,
+                gender="female",
+                preferences=""
+            )
             s.add_all([demo1, demo2])
             s.commit()
             all_users = [demo1, demo2]
@@ -163,24 +196,32 @@ def page_recommend():
     card_end()
 
 def page_social():
-    from models import AggregatedItem
+    card_start()
+    st.markdown("### 📱 Посты из соцсетей (без авторизации)")
+    kw = st.text_input("Ключевые слова (через запятую)", "ищу партнёра")
+    if st.button("Обновить ленту"):
+        threading.Thread(
+            target=lambda: fetch_social(db_session(), kw.split(",")),
+            daemon=True
+        ).start()
+        st.success("Фоновая загрузка запущена. Обновите страницу через несколько секунд.")
+
+    # ORM-запрос вместо raw SQL
     with db_session() as s:
-        # ORM-запрос: выбрать первые 20 записей с module='social', сортируя по published DESC
         rows = (
             s.query(AggregatedItem.title, AggregatedItem.source, AggregatedItem.link)
-            .filter(AggregatedItem.module == "social")
-            .order_by(AggregatedItem.published.desc())
-            .limit(20)
-            .all()
+             .filter(AggregatedItem.module == "social")
+             .order_by(AggregatedItem.published.desc())
+             .limit(20)
+             .all()
         )
 
-     if not rows:
-         st.info("Постов пока нет. Нажмите «Обновить ленту», чтобы собрать.")
-     else:
-         for title, source, link in rows:
-             st.markdown(f"• **[{source}]** [{title}]({link})")
-     card_end()
-
+    if not rows:
+        st.info("Постов пока нет. Нажмите «Обновить ленту», чтобы собрать.")
+    else:
+        for title, source, link in rows:
+            st.markdown(f"• **[{source}]** [{title}]({link})")
+    card_end()
 
 def page_analytics():
     card_start()
@@ -190,23 +231,18 @@ def page_analytics():
         if not guest:
             st.info("Пока нет данных, выполните хотя бы один поиск, чтобы появилась статистика.")
         else:
-            # Получаем все search_history для guest
             history = s.query(SearchHistory).filter(SearchHistory.user_id == guest.id).all()
             if history:
-                # Считаем, сколько раз встречается каждый стиль
                 stats = {}
                 for rec in history:
                     stl = rec.style or "—"
                     stats[stl] = stats.get(stl, 0) + 1
 
-                # Построим DataFrame: две колонки «style» и «count»
                 df = pd.DataFrame({
                     "style": list(stats.keys()),
                     "count": list(stats.values())
-                })
+                }).set_index("style")
 
-                # Используем st.bar_chart, передав DataFrame и указав, что индекс — стиль
-                df = df.set_index("style")
                 st.bar_chart(df["count"])
                 st.write("График количества поисков по стилям.")
             else:
